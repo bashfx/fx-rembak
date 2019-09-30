@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+#===============================================================================
+#-------------------------------------------------------------------------------
+#$ name:rembak|bak
+#$ author:qodeninja
+#$ autobuild: 00007
+#$ date:
+#-------------------------------------------------------------------------------
+#=====================================code!=====================================
+
+  args=("${@}");readonly T=0 F=1;
+
+  _buf=()
+
+  REMBAK_OUT="$HOME/rembak.out";
+  REMBAK_HOME="$HOME/.bak";
+  REMBAK_CACHE="$REMBAK_HOME/cache";
+  REMBAK_DATA="$REMBAK_HOME/data";
+
+
+  REMBAK_MAX_VERS=20
+  REMBAK_MAX_SIZE=2
+
+  OUTPUT=
+
+  BASE62=($(echo {0..9} {a..z} {A..Z} '_' '-' ))
+  #deps md5 realpath xz unxz
+
+  #support pipe
+  if [ -p /dev/stdin ]; then
+    pipe_data=$(cat)
+    args+=($pipe_data)
+  fi
+
+  trap - EXIT
+
+#-------------------------------------------------------------------------------
+# TERM
+#-------------------------------------------------------------------------------
+
+  red=$(tput setaf 202)
+  green=$(tput setaf 2)
+  blue=$(tput setaf 12)
+  orange=$(tput setaf 214)
+  grey=$(tput setaf 247)
+  x=$(tput sgr0)
+  eol=$(tput el)
+
+  delta="\xE2\x96\xB3";
+  pass="\xE2\x9C\x93";
+  fail="\xE2\x9C\x97";
+  lambda="\xCE\xBB";
+  tab=$'\t'
+  nl=$'\n'
+  sp="  "
+
+#-------------------------------------------------------------------------------
+# NON-POSIX
+#-------------------------------------------------------------------------------
+
+  md5cmd="$(which md5sum||which md5)"
+
+  xzcmd="$(which xz)"
+  unxzcmd="$(which unxz)"
+
+
+#-------------------------------------------------------------------------------
+# UTILS
+#-------------------------------------------------------------------------------
+
+  stderr(){ printf "${@}${x}\n" 1>&2; }
+
+
+  nprint(){
+    printf "%s%b%s" "${!2:-}" "${1:-}" 1>&2; ## 2 color is deref
+  }
+
+  nlprint(){
+    printf "%s%b%s" "${!2:-}" "${1:-}" "$nl" 1>&2;
+  }
+
+
+  noop(){ err="${last_cmd:-NOOP}"; return 1; }
+  command_exists(){ type "$1" &> /dev/null; }
+  def(){ printf -v "$1" '%s' "$2"; }
+  get_buffer(){ printf "${_buf[*]}"; }
+  buf_size(){ printf "${#_buf[@]}"; }
+
+  abs(){ printf $(realpath $1); }
+
+  not_empty_path(){
+    [ ! -z "$1" -a -e "$1" ] && return 0 || return 1
+  }
+
+  to_upper(){ echo $1 | tr '[a-z]' '[A-Z]'; }
+  to_lower(){ echo $1 | tr '[A-Z]' '[a-z]'; }
+
+  chr(){ printf \\$(printf '%03o' $1); }
+  ord(){ LC_CTYPE=C printf '%d' "'$1"; }
+  hex(){ printf "%%%02x\n" "'$1"; }
+
+
+  rand(){
+    local r i=${1:-100};
+    ((r=RANDOM%$i))
+    echo $r
+  }
+
+  make_dir(){
+    [ -z "$1" ] && err="Cant make_dir, path undefined." && return 1;
+    [ -e "$1" ] && warn="Path ($1) already exists." && return 2;
+    #log_silly "Making path... $1"
+    mkdir -p "$1"; return $?;
+  }
+
+  file_size(){
+    local path=$1
+    du -sLm $path | cut -f1 #macos only?
+  }
+
+  print_array(){
+    local i this arr=("${@}") len=${#arr[@]}
+    if [ $len -gt 0 ]; then
+      for i in ${!arr[@]}; do
+        this="${arr[$i]}"
+        stderr "$i:$this"
+      done
+    fi
+  }
+
+
+  wait_job(){
+    #printf "wait job?"
+    local info="$1" task="${2:-Task}" spin='-\|/' i=0 pid=$! # Process Id of the previous running command
+    tput civis
+    while kill -0 $pid 2>/dev/null; do
+      i=$(( (i+1) %4 ))
+      printf "\r${blue}${spin:$i:1} $info$x"
+      sleep .1
+    done
+    printf "\r${green}${pass} $task Done.${x}$eol$nl"
+    tput cnorm
+  }
+
+
+  confirm(){
+
+    local src ret cont=1 auto=${2:-0} y=${opt_yes:-1} bg="${bld}${green}" br="${bld}${red}" ret=1
+    nprint "${rl}${1}? > " "white2"
+
+    [[ "$auto" = "c" ]] && { auto=0; cont=0; } #continue with enter
+
+    [ $y -eq 0 -a $auto -eq 1 ] && nlprint "${br}auto no${x}\n" && return 1;
+    [ $y -eq 0 ] && nlprint "${bg}auto yes${x}\n" && return 0;
+
+    [[ -f ${BASH_SOURCE} ]] && src='/dev/stdin' || src='/dev/tty' #how does this work for pipe
+
+    while read -n 1 -s INPUT < $src; do
+      [ ${#INPUT} -eq 0 -a $cont -eq 0 ] && nprint "${bg}yes${x}" && return 0 || :
+      [ $? -eq 1 ] && stderr "Error occured?" && exit 1;
+      if [[ $INPUT = [YyNn10tf+\-q] ]]; then
+        [[ $INPUT = [Yyt1+] ]] && nprint "${bg}yes${x}" && ret=0 || :
+        [[ $INPUT = [Nnf0\-] ]] && nprint "${br}no${x}" && ret=1 || :
+        [[ $INPUT = [q] ]] && stderr "\n" && exit 1 || :
+        break
+      fi
+    done
+    stderr " ${nl}${x}"
+    return $ret
+  }
+
+#-------------------------------------------------------------------------------
+# API
+#-------------------------------------------------------------------------------
+  err_cant_bak_root(){
+    stderr "${red}Sorry you cant rembak root!${x}";
+    exit 1
+  }
+
+  find_hash_any(){
+    local ref="$1" mode="${2:-d}" start="${3:-$REMBAK_CACHE}"
+    regex="(${ref}[a-f0-9]*__.+|[a-f0-9]+__.*${ref}.*)"
+    _buf=($(find "$start" -type $mode ! -path . -exec basename {} ';'| sort | grep -P "$regex" ))
+    printf "${_buf[*]}";
+  }
+
+  #by hash or hash partial
+  find_hash_refs(){
+    local hashref="$1" mode="${2:-d}" start="${3:-$REMBAK_CACHE}"
+    regex="(${hashref}[a-f0-9]*__.+)" #predetermined hash using greedy like
+    _buf=($(find "$start" -type $mode ! -path . -exec basename {} ';'| sort | grep -P "$regex" ))
+    printf "${_buf[*]}";
+  }
+
+  find_all_of(){
+    local mode="${1:-d}" start="${2:-$REMBAK_CACHE}"
+    _buf=($(find "$start" -type $mode ! -path . -exec basename {} ';'| sort ));
+    printf "${_buf[*]}";
+  }
+
+
+
+  hashify_path(){
+    local path=$1 base name hname ftype
+    path=$(abs $path);
+    if [ ! -z "$path" ]; then
+      base="${path%/*}" #everything after last /
+      [ -z "$base" ] && err_cant_bak_root;
+      [ -d $path ] && ftype="dir" || ftype="file";
+
+      name="${base##*/}"
+      name="${name//./_}"
+
+      hsum=($(echo $base | $md5cmd))
+      #bsum=$(encode16 $hsum);
+      hname="${hsum}__${name}"
+
+      #stderr "path:$path \nbase:$base \nname:$name \ntype:$ftype \nhname:$hname"
+      printf "$hname";
+    fi
+  }
+
+
+  query_hashes(){
+    local hname query=$1 any=${2:-1} _ref;
+
+    if [ ! -z "$query" ]; then
+
+      if [ -d "$REMBAK_CACHE" ]; then
+
+        [ $any -eq 0 ] && cmd='find_hash_any' || cmd='find_hash_refs';
+        _buf=($($cmd "$query" "f" "$REMBAK_CACHE"))
+        _ref=($(get_buffer));
+        len="${#_ref[@]}"
+
+        #stderr "Found $len $hsum"
+
+        [ $len -gt 0 ] && printf "${_ref[*]}" || :;
+
+      fi
+    fi
+
+  }
+
+
+  dehash(){
+    local hsum="$1" hname hpath res
+
+    hpath="$REMBAK_CACHE/$1"
+
+    if not_empty_path "$hpath"; then
+      cat $hpath;
+    else
+      res=($(query_hashes $hsum 0));
+      #printf "${res[*]}"
+      len="${#res[@]}"
+
+      if [ $len -gt 0 ]; then
+        hname="${res[0]}"
+        hpath="$REMBAK_CACHE/$hname";
+
+        if [ -f $hpath ]; then
+          cat $hpath;
+        else
+          stderr "Path $hpath DNE"
+        fi
+
+      fi
+    fi
+
+  }
+
+  cachify_path(){
+    local hname hsum base len path=$1 _ref;
+
+    path=$(abs $path); # realpath
+
+    hname=$(hashify_path $path);
+
+    res=(${hname//__/ });
+    hsum=${res[0]};
+
+    #stderr "Hsum $hsum"
+
+    res=($(query_hashes $hsum));
+    len="${#res[@]}"
+
+    stderr "Found $len $hsum"
+
+    if [ $len -eq 0 ]; then
+      base="${path%/*}"
+      printf "$base" > "$REMBAK_CACHE/$hname";
+      stderr "${blue}Saving cache $hname${x}"
+    else
+      hsum="${res[0]}"
+      stderr "${orange}Found existing $hsum $len ${x}"
+    fi
+
+    OUTPUT="$hname"
+
+  }
+
+  next_path(){
+    :
+  }
+
+
+  bakdir_name(){
+    local path=$1 abs_path hname base name res hsum;
+
+    abs_path="$(abs $path)";
+    hname="$(hashify_path $abs_path)";
+
+    #using the symlink version of path for name
+    base="${path%/*}"
+    name="${path##*/}"
+    name="${name//./_}"
+    res=(${hname//__/ });
+    hsum=${res[0]};
+    #stderr "hsum $hsum $nl"
+    bsum=$(encode16 $hsum);
+
+    #stderr "$path $abs_path $base $name $hsum"
+    printf "${name}.${bsum}"
+  }
+
+
+#-------------------------------------------------------------------------------
+# BAKUPIFY
+#-------------------------------------------------------------------------------
+  bak_zname(){
+    local arr size bak="$1";
+    arr=($(find_all_of 'f' "$bak_path"))
+    size=${#arr[@]};
+    if [ $REMBAK_MAX_VERS -le $size ]; then
+      if ! confirm "${orange}${delta} Backup ($name) has max ($REMBAK_MAX_VERS) versions. Continue${x}"; then
+        exit 1;
+      fi
+    fi
+    printf -v vers "%03d" "$size";
+
+    zname="${name}.${vers}.tar.xz"
+    printf "$zname";
+  }
+
+  backupify_dir_size(){
+    local path=$1 size ret=1;
+    (file_size $path > "$REMBAK_OUT" ) & wait_job "Checking directory size, this may take a minute..." "Checksize ($path)"
+    OUTPUT=$(cat $REMBAK_OUT)
+    size=$( echo "scale=2;$OUTPUT/1024" | bc )
+    if [ $( echo "$size>2" | bc ) -eq 1 ]; then
+      if confirm "${nl}Dir ($path) is $size GB. Backup anyway"; then
+        ret=0
+      fi
+    else
+      ret=0
+    fi
+    return $ret;
+  }
+
+  backupify_bak_size(){
+    local size bak_path="$1" ret=1;
+    (file_size $bak_path > "$REMBAK_OUT" ) & wait_job "Checking current backup size for ($name)" "Checksize (rembak/$name)"
+    size=$( echo "scale=2;$OUTPUT/1024" | bc )
+    if [ $( echo "$size>$REMBAK_MAX_SIZE" | bc ) -eq 1 ]; then
+      printf "${red}Backup ($name) has reached max ($REMBAK_MAX_SIZE). Please cleanup before bakup!$x";
+      exit 1
+    fi
+  }
+
+  backupify(){
+    local path=$1 dname dat_path="$REMBAK_DATA" arr size vers do_comp=1;
+
+    dname="$(bakdir_name $path)"
+
+    bak_path="$dat_path/$dname/v"
+
+    [ ! -d "$bak_path" ] && make_dir "$bak_path" || :;
+
+    name="${dname%.*}"
+    bsum="${dname##*.}"
+
+    #arr=($(find_all_of 'f' "$bak_path"))
+    zname=$(bak_zname "$bak_path")
+
+
+    target="$bak_path/${zname}"
+
+
+    touch $target;
+
+
+    #conv62 $hsum 2 16;
+    #hsum=$(decode62 $bsum);
+
+    #printf "target $nl $target ${nl}<=$nl $path $nl"
+
+    backupify_dir_size "$path"; do_comp=$?;
+
+    backupify_bak_size "$bak_path"; #haed exit
+
+
+    if [ $do_comp -eq 0 ]; then
+      (compress_dir "$path" "$name" "$target" > "$REMBAK_OUT" ) & wait_job "XZ Compressing ($name => $zname) [${size}GB] file. Please wait..." "XZ Compression ($zname)"
+    fi
+
+  }
+
+
+  compress_dir(){
+    local src=$1 tname=$2 target=$3
+    #$xzcmd -kf -9
+    local temp=$(mktemp /tmp/rembak.XXXXXXXX)
+
+    #exclude works on mac
+    { tar -Hc --exclude '.git' --exclude 'node_modules' --exclude 'docker' "$src" | xz -kf -9  > "$temp"; } &>/dev/null;
+
+    printf "temp $temp $nl target: $target"
+
+    mv "$temp" "$target"
+
+  }
+
+
+
+  driver(){
+    local arr
+    arr=($(find_all_of 'f'))
+    printf -v size "%03d" "${#arr[@]}";
+    print_array "${arr[@]}";
+    printf "$size"
+  }
+
+#-------------------------------------------------------------------------------
+# ENCODE
+#-------------------------------------------------------------------------------
+
+
+  # echo 'hello1234' | md5 | echo -n | od -An -tuC
+  #echo 'hello1234' |  od -An -tuC
+  #crc32 <(echo "some string")
+  #printf $(printf '\%o' {32..127}).
+  #echo "$1" |  od -An -tuC
+  #echo 'a'|od -N 1 -i|head -1|tr -s " "|cut -d " " -f 2
+
+  convBase(){
+    local ob ib ival
+    ival="$(to_upper $1)";
+    ob=${2:-10};
+    ib=${3:-16};
+    printf -v out "obase=%d; ibase=%d; %s\n" $ob $ib $ival
+    echo -n "$out" | bc
+  }
+
+
+  #hex -> 62
+  encode16(){
+    local i d out= st="$1"
+    d="$(convBase $st 10 16)"
+    for i in $(echo "obase=62; $d" | BC_LINE_LENGTH=0 bc); do
+       #i=$(echo $i | tr -d '\000')
+       i="$((10#$i))"
+       out="$out${BASE62[$i]}"
+       #list="$list:$i"
+    done
+    #printf "$d ::: $out\n $list $nl"
+    #printf "$(convBase $d 2 10)" binary
+    printf "$out"
+  }
+
+
+  #62 -> dec only works for short
+  encode62(){
+    local i ascii out= st="$1"
+    d="$((62#$st))"
+    for i in $(echo "obase=62; $d" | BC_LINE_LENGTH=0 bc); do
+       #out="$i:${BASE62[$i]}::$out"
+       i="$((10#$i))"
+       out="$out${BASE62[$i]}"
+    done
+    printf "$d ::: $out\n"
+  }
+
+
+  # 62 -> 10
+  decode62(){
+    local i q this idx out= st="$1" mult ttl=0 len pow
+    len="${#st}"
+    for (( i=0; i<len; i++ )); do
+      this="${st:$i:1}"
+      idx=$(echo ${BASE62[@]/$this//} | cut -d/ -f1 | wc -w | tr -d ' ') #hacky indexOf
+      ((pow=(len-1)-i))
+      mult=$(echo "${idx}*(62^${pow})" | bc );
+      ttl="${mult} + ${ttl}" #generate sum list
+      out+="$idx:[$i]";
+    done
+    printf -v bcmd '%s' "$ttl"
+    d="$(echo $bcmd | bc )"; #apply sum
+    h="$(convBase $d 16 10)"
+    printf -v h "%032s" "$h" #add leading 0s
+    printf "$(to_lower $h)"
+  }
+
+
+#-------------------------------------------------------------------------------
+# API
+#-------------------------------------------------------------------------------
+
+  init(){
+    if [ ! -d "$REMBAK_HOME" ]; then
+      make_dir "$REMBAK_DATA";
+      make_dir "$REMBAK_CACHE";
+      make_dir "$REMBAK_HOME/priv/snaps";
+    fi
+  }
+
+#-------------------------------------------------------------------------------
+# MAIN
+#-------------------------------------------------------------------------------
+
+  dispatch(){
+    local call="$1" cmd run_cmd arg is_noop=$F ret;
+
+    init
+
+    case "$call" in
+      noop) is_noop=$T;;
+       bak) cmd='backupify'; arg="$2 $3";;
+      rand) cmd='rand'; arg=$2;;
+      hash) cmd='hashify_path'; arg=$2;;
+    dehash) cmd='dehash'; arg=$2;;
+     cache) cmd='cachify_path'; arg=$2;;
+     query) cmd='query_hashes'; arg="$2 0";;
+    enc62)  cmd='encode62'; arg="$2";;
+    enc16)  cmd='encode16'; arg="$2";;
+    dec62)  cmd='decode62'; arg="$2";;
+     test)  cmd='driver'; arg="$2";;
+         *) : ;;
+    esac
+
+    [ $is_noop -eq $T ] && last_cmd="$cmd" && cmd="noop";
+
+    run_cmd+="$cmd ";
+    if [ -z "$cmd" ]; then
+      err="Missing command [${unk[*]}]"
+      return 1
+    fi
+
+    [ ! -z "$arg" ] && run_cmd+="$arg ";
+
+
+    [ -n "$err" ] && return 1;
+    $run_cmd;ret=$?;
+    return $ret;
+  }
+
+  main(){
+    local ret;
+    dispatch "$@";ret=$?
+    [ -n "$warn" ] && stderr "$orange$warn$x" || :
+    [ -n "$err"  ] && stderr "${red}$err" || stderr "$out";
+    unset out err edit;
+    return $ret
+  }
+
+#-------------------------------------------------------------------------------
+
+  main "${args[@]}";
+
+#-------------------------------------------------------------------------------
+#=====================================!code=====================================
